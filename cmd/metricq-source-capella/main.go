@@ -1,11 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"slices"
@@ -15,9 +14,11 @@ import (
 
 	"github.com/bougou/go-ipmi"
 	metricq "github.com/metricq/metricq-go"
+
+	"github.com/metricq/metricq-source-capella/pkg/command"
 )
 
-func createConnection(host string) (*ipmi.Client, error) {
+func startIPMISession(host string) (*ipmi.Client, error) {
 	port := 623
 	username := ""
 	password := ""
@@ -74,41 +75,38 @@ func (client *Client) Close(ctx context.Context) {
 	client.ipmi.Close(ctx)
 }
 
-type EnergyReading struct {
-	timestamp    time.Time
-	timestamp_s  uint32
-	timestamp_ms uint16
-	energy_j     uint32
-	energy_mj    uint16
-}
+func (client *Client) SinglePowerCommand(ctx context.Context) (command.PowerReading, error) {
+	r := command.PowerReading{}
 
-func NewReading() EnergyReading {
-	return EnergyReading{timestamp: time.Now()}
-}
+	slog.Info("sending IPMI Raw Command", "node", client.nodeName, "command", "single power")
 
-func (r *EnergyReading) Unpack(buf []byte) error {
-	if len(buf) != 14 {
-		return fmt.Errorf("unexpected buffer length: %v != 14", len(buf))
+	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 8, 0, 0, 0}, "")
+	if err != nil {
+		return r, fmt.Errorf("failed to execute single power command: %w", err)
 	}
 
-	r.timestamp_s = binary.LittleEndian.Uint32(buf[8:12])
-	r.timestamp_ms = binary.LittleEndian.Uint16(buf[12:14])
-	r.energy_j = binary.LittleEndian.Uint32(buf[2:6])
-	r.energy_mj = binary.LittleEndian.Uint16(buf[6:8])
-
-	return nil
+	err = r.Unpack(response.Response)
+	if err != nil {
+		return r, fmt.Errorf("failed to unpack single power command response: %w", err)
+	}
+	return r, nil
 }
 
-func (r *EnergyReading) Time() time.Time {
-	return time.Unix(int64(r.timestamp_s), int64(r.timestamp_ms)*1000*1000)
-}
+func (client *Client) SingleEnergyCommand(ctx context.Context) (command.EnergyReading, error) {
+	r := command.EnergyReading{}
 
-func (r *EnergyReading) HostTime() time.Time {
-	return r.timestamp
-}
+	slog.Info("sending IPMI Raw Command", "node", client.nodeName, "command", "single energy")
 
-func (r *EnergyReading) Energy() float64 {
-	return float64(r.energy_j) + float64(r.energy_mj)/1000
+	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 2, 0, 0, 0}, "")
+	if err != nil {
+		return r, fmt.Errorf("failed to execute single energy command: %w", err)
+	}
+
+	err = r.Unpack(response.Response)
+	if err != nil {
+		return r, fmt.Errorf("failed to unpack single energy command response: %w", err)
+	}
+	return r, nil
 }
 
 const cpuMetricPattern string = "hpc.capella.c%d.cpu.power.acc"
@@ -119,6 +117,8 @@ const fromEnergyMetricPattern string = "hpc.capella.c%d.power.fe"
 const hostPattern string = "c%d.bmc.capella.hpc.tu-dresden.de"
 
 func main() {
+	
+
 	log.Printf("opening connection to metricq")
 
 	connectionStart := time.Now()
@@ -168,7 +168,7 @@ func main() {
 			node_metric := fmt.Sprintf(nodeMetricPattern, i)
 			energy_metric := fmt.Sprintf(energyPattern, i)
 			from_energy_metric := fmt.Sprintf(fromEnergyMetricPattern, i)
-			client, err := createConnection(hostname)
+			client, err := startIPMISession(hostname)
 
 			if err != nil {
 				log.Printf("Failed to connect to %s: %v", hostname, err)
@@ -247,75 +247,69 @@ func main() {
 			defer wg.Done()
 			defer client.Close(ctx)
 
-			var lastReading *EnergyReading
+			var lastReading *command.EnergyReading
+			var lastTimestamp time.Time
 
 		WorkerLoop:
 			for {
 				start := time.Now()
 
-				// log.Printf("sending IPMI Raw Command to %s", host)
-				response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 8, 0, 0, 0}, "")
+				r, err := client.SinglePowerCommand(ctx)
 				if err != nil {
+					slog.Error(fmt.Sprintf("failed to execute raw command for power: %v", err), "node", host)
 					errorMutex.Lock()
-					log.Printf("[%34s] Failed to execute raw command for power: %s", host, err)
-
 					connectionErrors[host] += 1
 					errorMutex.Unlock()
 				} else {
-					buf := bytes.NewBuffer(response.Response[6:14])
-					var cpu_power uint16
-					var gpu_power uint16
-					binary.Read(buf, binary.LittleEndian, &cpu_power)
-					binary.Read(buf, binary.LittleEndian, &gpu_power)
 
-					if cpu_power > 1000 {
-						log.Printf("[%34s] Read implausible cpu power value: %v W", host, cpu_power)
+					if r.CpuPower() > 1000 {
+						slog.Warn("read implausible cpu power value", "node", host, "value", r.CpuPower())
 						errorMutex.Lock()
 						valueErrors[host] += 1
 						errorMutex.Unlock()
 					}
 
-					if gpu_power > 4000 {
-						log.Printf("[%34s] Read implausible gpu power value: %v W", host, gpu_power)
+					if r.GpuPower() > 4000 {
+						slog.Warn("read implausible gpu power value", "node", host, "value", r.GpuPower())
 						errorMutex.Lock()
 						valueErrors[host] += 1
 						errorMutex.Unlock()
 					}
 
-					// log.Printf("Read Power Values for %s: %d W CPU; %d W GPU", host, cpu_power, gpu_power)
+					slog.Debug(fmt.Sprintf("Read Power Values for %s: %d W CPU; %d W GPU", host, int(r.CpuPower()), int(r.GpuPower())), "node", host)
 
-					err = client.cpu.Send(ctx, start, float64(cpu_power))
+					err = client.cpu.Send(ctx, start, r.CpuPower())
 					if err != nil {
-						log.Fatalf("Failed to send metric %s: %v", client.cpu.Name(), err)
+						slog.Error("failed to send metric", "node", host, "err", err, "metric", client.cpu.Name())
+						panic(err)
 					}
 
-					err = client.gpu.Send(ctx, start, float64(gpu_power))
+					err = client.gpu.Send(ctx, start, r.GpuPower())
 					if err != nil {
-						log.Fatalf("Failed to send metric %s: %v", client.gpu.Name(), err)
+						slog.Error("failed to send metric", "node", host, "err", err, "metric", client.gpu.Name())
+						panic(err)
 					}
 
-					err = client.node.Send(ctx, start, float64(cpu_power+gpu_power))
+					err = client.node.Send(ctx, start, r.NodePower())
 					if err != nil {
-						log.Fatalf("Failed to send metric %s: %v", client.gpu.Name(), err)
+						slog.Error("failed to send metric", "node", host, "err", err, "metric", client.node.Name())
+						panic(err)
 					}
 				}
 
-				response, err = client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 2, 0, 0, 0}, "")
+				currentReading, err := client.SingleEnergyCommand(ctx)
 				if err != nil {
+					slog.Error(fmt.Sprintf("failed to execute raw command: %v", err), "node", host, "command", "single energy")
 					errorMutex.Lock()
-					log.Printf("[%34s] Failed to execute raw command for energy: %s", host, err)
-
 					connectionErrors[host] += 1
 					errorMutex.Unlock()
-				} else if len(response.Response) >= 14 {
-					currentReading := EnergyReading{timestamp: time.Now()}
-                    currentReading.Unpack(response.Response)
-
+				} else {
+					hostTime := time.Now()
 					if lastReading != nil {
 						timestamp := currentReading.Time()
-						offset := currentReading.HostTime().Sub(timestamp)
+						offset := hostTime.Sub(timestamp)
 						if offset.Abs().Seconds() > 10 {
-							// log.Printf("[%34s] Read implausible energy timestamp: Offset %v sec (%v </> %v)", host, int(offset.Seconds()), timestamp, currentReading.HostTime())
+							slog.Warn("read implausible energy timestamp", "node", host, "offset", int(offset.Seconds()), "timestamp", timestamp, "hostTime", hostTime)
 							errorMutex.Lock()
 							timeErrors[host] += 1
 							errorMutex.Unlock()
@@ -323,51 +317,46 @@ func main() {
 
 						duration_s := timestamp.Sub(lastReading.Time()).Seconds()
 						if duration_s < 0 {
-							log.Printf("[%34s] duration is negative: %v </> %v", host, lastReading.Time(), timestamp)
+							slog.Warn("duration is negative", "node", host, "lastTimestamp", lastReading.Time(), "timestamp", timestamp)
 							errorMutex.Lock()
 							timeErrors[host] += 1
 							errorMutex.Unlock()
 						}
 
 						// using host time instead to calculate the energy
-						duration_s = currentReading.HostTime().Sub(lastReading.HostTime()).Seconds()
+						duration_s = hostTime.Sub(lastTimestamp).Seconds()
 
 						energy_j := currentReading.Energy() - lastReading.Energy()
 						if energy_j < 0 {
-							log.Printf("[%34s] energy is negative. Possible overflow? %v </> %v", host, lastReading.Energy(), currentReading.Energy())
+							slog.Warn("energy is negative. Possible overflow?", "node", host, "previous energy", lastReading.Energy(), "current energy", currentReading.Energy())
 							errorMutex.Lock()
 							valueErrors[host] += 1
 							errorMutex.Unlock()
 						}
 
-						err = client.energy.Send(ctx, currentReading.timestamp, energy_j)
+						err = client.energy.Send(ctx, currentReading.Time(), energy_j)
 						if err != nil {
-							log.Fatalf("[%34s] failed to send energy metric %s: %v", host, client.energy.Name(), err)
+							slog.Error("failed to send metric", "node", host, "err", err, "metric", client.energy.Name())
+							panic(err)
 						}
 
-						err = client.from_energy.Send(ctx, currentReading.timestamp, energy_j/duration_s)
+						err = client.from_energy.Send(ctx, currentReading.Time(), energy_j/duration_s)
 						if err != nil {
-							log.Fatalf("[%34s] failed to send metric %s: %v", host, client.cpu.Name(), err)
+							slog.Error("failed to send metric", "node", host, "err", err, "metric", client.from_energy.Name())
+							panic(err)
 						}
 					}
 
 					lastReading = &currentReading
-				} else {
-					log.Printf("[%s] ipmi raw command response for energy has wrong format", host)
-				}
-
-				duration := time.Now().Sub(start)
-
-				if duration > time.Second {
-					log.Printf("[%s] request took: %v", host, duration)
+					lastTimestamp = hostTime
 				}
 
 				if deadline.Before(time.Now()) {
-					log.Printf("[%s] missed deadline: %v", host, deadline)
+					slog.Warn("missed deadline", "node", host)
 				}
 
 				for ; deadline.Before(time.Now()); deadline = deadline.Add(time.Second) {
-                    // we count every missed deadline as one connection error
+					// we count every missed deadline as one connection error
 					errorMutex.Lock()
 					connectionErrors[host] += 1
 					errorMutex.Unlock()

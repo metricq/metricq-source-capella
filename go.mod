@@ -1,11 +1,10 @@
-module github.com/metricq/metricq-source-ipmi
+module github.com/metricq/metricq-source-capella
 
 go 1.21
 
 toolchain go1.23.2
 
 require (
-	// github.com/bougou/go-ipmi v0.4.1-0.20240219025858-089b836031ea
 	github.com/bougou/go-ipmi v0.7.3
 	github.com/metricq/metricq-go v0.0.0
 )
