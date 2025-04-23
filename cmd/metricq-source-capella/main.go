@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"log/slog"
@@ -47,17 +48,6 @@ func startIPMISession(host string) (*ipmi.Client, error) {
 	// time. So let's set a ridiculous low timeout.
 	client.WithTimeout(900 * time.Millisecond)
 
-	// TODO Add proper code to trigger recalibration on startup
-	// According to documentation, this process take 2-5 minutes! Yes, minutes
-	// While the calibration is running, this should return 0
-	// response, err := client.RawCommand(0x3A, 0x32, []byte{4, 3, 0}, "")
-	//     if err == nil {
-	//         log.Printf("failed to read sample time: %v", err)
-	//     } else {
-	//         sampleTime := binary.LittleEndian.Uint32(response.Response[0:4])
-	//         log.Printf("[%34s] sample time: %v", host, sampleTime)
-	//     }
-
 	return client, nil
 }
 
@@ -73,6 +63,47 @@ type Client struct {
 
 func (client *Client) Close(ctx context.Context) {
 	client.ipmi.Close(ctx)
+}
+
+func (client *Client) ReadExactSampleTime(ctx context.Context) (time.Duration, error) {
+	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 3, 0}, "")
+	if err != nil {
+		return 0, fmt.Errorf("failed to read exact sample time: %w", err)
+	}
+
+	if len(response.Response) != 4 {
+		return 0, fmt.Errorf("failed to read exact sample time: unexpected buffer length: %v != 4", len(response.Response))
+	}
+
+	offset_ns := int64(binary.LittleEndian.Uint32(response.Response[0:4]))
+
+	return time.Duration(offset_ns), nil
+}
+
+func (client *Client) RecalibrateSampleTime(ctx context.Context) error {
+	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 3, 2}, "")
+	if err != nil {
+		return fmt.Errorf("failed to recalibrate sample time: %w", err)
+	}
+
+	if len(response.Response) != 0 {
+		return fmt.Errorf("failed to recalibrate sample time: unexpected buffer length: %v != 0", len(response.Response))
+	}
+
+	return nil
+}
+
+func (client *Client) ResetEnergyAccumulator(ctx context.Context) error {
+	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 3, 1}, "")
+	if err != nil {
+		return fmt.Errorf("failed to reset energy accumulator: %w", err)
+	}
+
+	if len(response.Response) != 0 {
+		return fmt.Errorf("failed to reset energy accumulator: unexpected buffer length: %v != 0", len(response.Response))
+	}
+
+	return nil
 }
 
 func (client *Client) SinglePowerCommand(ctx context.Context) (command.PowerReading, error) {
@@ -110,9 +141,11 @@ func (client *Client) SingleEnergyCommand(ctx context.Context) (command.EnergyRe
 }
 
 func (client *Client) Reconnect(ctx context.Context) error {
-	if err := client.ipmi.Close(ctx); err != nil {
-		return fmt.Errorf("failed to reconnect IPMI: %w", err)
-	}
+	// TODO seems like on timeout the channel is already closed.
+	// Hopefully, that's always the case, otherwise we leak channels
+	// if err := client.ipmi.Close(ctx); err != nil {
+	// 	return fmt.Errorf("failed to reconnect IPMI: %w", err)
+	// }
 
 	session, err := startIPMISession(client.nodeName)
 	if err != nil {
@@ -175,7 +208,7 @@ func main() {
 		timeErrors[host] = 0
 		valueErrors[host] = 0
 
-		go func(i int, hostname string) {
+		go func(i int, hostname string, ctx context.Context) {
 			defer wg.Done()
 
 			cpu_metric := fmt.Sprintf(cpuMetricPattern, i)
@@ -189,6 +222,30 @@ func main() {
 				log.Printf("Failed to connect to %s: %v", hostname, err)
 				return
 			}
+
+			c := Client{
+				client,
+				fmt.Sprintf("c%d", i),
+				source.Metric(cpu_metric),
+				source.Metric(gpu_metric),
+				source.Metric(node_metric),
+				source.Metric(energy_metric),
+				source.Metric(from_energy_metric),
+			}
+
+			// slog.Info("starting to recalibrate sample time", "node", c.nodeName)
+			// if err := c.RecalibrateSampleTime(ctx); err != nil {
+			// 	slog.Warn(err.Error(), "node", c.nodeName)
+			// } else {
+			// 	for offset, err := c.ReadExactSampleTime(ctx); offset == 0; {
+			// 		if err != nil {
+			// 			slog.Warn(err.Error(), "node", c.nodeName)
+			// 			break
+			// 		}
+			// 		time.Sleep(time.Second)
+			// 	}
+			// }
+			// slog.Info("finished to recalibrate sample time", "node", c.nodeName)
 
 			initMutex.Lock()
 			defer initMutex.Unlock()
@@ -219,16 +276,8 @@ func main() {
 				Rate:        1,
 			}
 
-			clients[hostname] = Client{
-				client,
-				fmt.Sprintf("c%d", i),
-				source.Metric(cpu_metric),
-				source.Metric(gpu_metric),
-				source.Metric(node_metric),
-				source.Metric(energy_metric),
-				source.Metric(from_energy_metric),
-			}
-		}(i, host)
+			clients[hostname] = c
+		}(i, host, ctx)
 	}
 
 	wg.Wait()
