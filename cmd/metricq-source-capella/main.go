@@ -109,6 +109,21 @@ func (client *Client) SingleEnergyCommand(ctx context.Context) (command.EnergyRe
 	return r, nil
 }
 
+func (client *Client) Reconnect(ctx context.Context) error {
+	if err := client.ipmi.Close(ctx); err != nil {
+		return fmt.Errorf("failed to reconnect IPMI: %w", err)
+	}
+
+	session, err := startIPMISession(client.nodeName)
+	if err != nil {
+		return fmt.Errorf("failed to reconnect IPMI: %w", err)
+	}
+
+	client.ipmi = session
+
+	return nil
+}
+
 const cpuMetricPattern string = "hpc.capella.c%d.cpu.power.acc"
 const gpuMetricPattern string = "hpc.capella.c%d.gpu.power.acc"
 const nodeMetricPattern string = "hpc.capella.c%d.power"
@@ -153,7 +168,7 @@ func main() {
 	errorMutex := sync.Mutex{}
 
 	wg := sync.WaitGroup{}
-	for i := 1; i <= 148; i++ {
+	for i := 1; i <= 156; i++ {
 		wg.Add(1)
 		host := fmt.Sprintf(hostPattern, i)
 		connectionErrors[host] = 0
@@ -260,6 +275,9 @@ func main() {
 					errorMutex.Lock()
 					connectionErrors[host] += 1
 					errorMutex.Unlock()
+					if err := client.Reconnect(ctx); err != nil {
+						slog.Error(fmt.Sprintf("failed to reconnect IPMI: %v", err), "node", host)
+					}
 				} else {
 
 					if r.CpuPower() > 1000 {
@@ -297,6 +315,7 @@ func main() {
 					}
 				}
 
+				start = time.Now()
 				currentReading, err := client.SingleEnergyCommand(ctx)
 				if err != nil {
 					slog.Error(fmt.Sprintf("failed to execute raw command: %v", err), "node", host, "command", "single energy")
@@ -334,13 +353,13 @@ func main() {
 							errorMutex.Unlock()
 						}
 
-						err = client.energy.Send(ctx, currentReading.Time(), energy_j)
+						err = client.energy.Send(ctx, start, currentReading.Energy())
 						if err != nil {
 							slog.Error("failed to send metric", "node", host, "err", err, "metric", client.energy.Name())
 							panic(err)
 						}
 
-						err = client.from_energy.Send(ctx, currentReading.Time(), energy_j/duration_s)
+						err = client.from_energy.Send(ctx, start, energy_j/duration_s)
 						if err != nil {
 							slog.Error("failed to send metric", "node", host, "err", err, "metric", client.from_energy.Name())
 							panic(err)
