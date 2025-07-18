@@ -171,7 +171,7 @@ func (client *Client) Reconnect(ctx context.Context) error {
 const hostPattern string = "c%d.bmc.capella.hpc.tu-dresden.de"
 
 func main() {
-	hg := hist.NewHistogram(40)
+	hg := hist.NewHistogram(60)
 
 	var verbosityFlag string
 	flag.StringVar(&verbosityFlag, "verbosity", "WARN", "Sets the verbosity of logging. Allowed values: [DEBUG, INFO, WARN, ERROR]")
@@ -269,9 +269,20 @@ func main() {
 
 			var lastBulkReading *command.BulkEnergyReading
 
+			if reading, err := client.BulkEnergyCommand(ctx); err != nil {
+                log.Fatal("failed first reading. Node not available?")
+			} else {
+				lastBulkReading = &reading
+			}
+
 		WorkerLoop:
 			for {
+                // start := time.Now()
 				currentBulkReading, err := client.BulkEnergyCommand(ctx)
+                // end := time.Now()
+
+                //slog.Info(fmt.Sprintf("request took %v ms", end.Sub(start).Milliseconds()))
+
 				if err != nil {
 					slog.Error(fmt.Sprintf("failed to execute raw command: %v", err), "node", host, "command", "single energy")
 					if err := client.Reconnect(ctx); err != nil {
@@ -279,17 +290,16 @@ func main() {
 					}
 				} else if lastBulkReading != nil {
 					if lastBulkReading.Timestamp() != currentBulkReading.Timestamp() {
-						slog.Info(fmt.Sprintf("Reading update: %v Diff: %v", currentBulkReading.Timestamp(), currentBulkReading.Timestamp().Sub(lastBulkReading.Timestamp())), "node", host)
+						slog.Info(fmt.Sprintf("Reading update: %v Diff: %v ms", currentBulkReading.Timestamp(), currentBulkReading.Timestamp().Sub(lastBulkReading.Timestamp()).Milliseconds()), "node", host)
 						hg.Add(float64(currentBulkReading.Timestamp().Sub(lastBulkReading.Timestamp()).Milliseconds()))
 
 						lastBulkReading = &currentBulkReading
-
 						fmt.Print(hg.String())
+                        fmt.Printf("Mean: %v", hg.Mean())
 					}
 				}
 
 				for ; deadline.Before(time.Now()); deadline = deadline.Add(LOOP_INTERVAL) {
-					//slog.Info("missed deadline", "node", host)
 				}
 
 				select {
