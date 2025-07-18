@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/VividCortex/gohistogram v1.0.0 // indirect
 	github.com/google/uuid v1.3.1 // indirect
 	github.com/kr/pretty v0.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
@@ -22,4 +23,5 @@ require (
 )
 
 replace github.com/metricq/metricq-go => ../metricq-go
+
 replace github.com/bougou/go-ipmi => ../go-ipmi
