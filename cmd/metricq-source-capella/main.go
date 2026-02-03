@@ -3,28 +3,30 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/bougou/go-ipmi"
+	"github.com/getsentry/sentry-go"
 	metricq "github.com/metricq/metricq-go"
 
 	"github.com/metricq/metricq-source-capella/pkg/command"
 )
 
-func startIPMISession(host string) (*ipmi.Client, error) {
-	port := 623
-	username := ""
-	password := ""
+type MetricQConfig struct {
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
 
-	log.Printf("opening connection to %s", host)
+func startIPMISession(ctx context.Context, host, username, password string) (*ipmi.Client, error) {
+	port := 623
 
 	client, err := ipmi.NewClient(host, port, username, password)
 	if err != nil {
@@ -37,10 +39,10 @@ func startIPMISession(host string) (*ipmi.Client, error) {
 	client.WithInterface(ipmi.InterfaceLanplus)
 	client.WithCipherSuiteID(ipmi.CipherSuiteID17)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	if err := client.Connect(ctx); err != nil {
+	if err := client.Connect(ctxTimeout); err != nil {
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
 
@@ -52,17 +54,77 @@ func startIPMISession(host string) (*ipmi.Client, error) {
 }
 
 type Client struct {
-	ipmi        *ipmi.Client
-	nodeName    string
-	cpu         *metricq.SourceMetric
-	gpu         *metricq.SourceMetric
-	node        *metricq.SourceMetric
-	energy      *metricq.SourceMetric
-	from_energy *metricq.SourceMetric
+	ipmi       *ipmi.Client
+	nodeName   string
+	hostname   string
+	user       string
+	password   string
+	cpu        *metricq.SourceMetric
+	gpu        *metricq.SourceMetric
+	node       *metricq.SourceMetric
+	energy     *metricq.SourceMetric
+	fromEnergy *metricq.SourceMetric
+}
+
+const cpuMetricPattern string = "hpc.capella.%s.cpu.power.acc"
+const gpuMetricPattern string = "hpc.capella.%s.gpu.power.acc"
+const nodeMetricPattern string = "hpc.capella.%s.power"
+const energyPattern string = "hpc.capella.%s.energy"
+const fromEnergyMetricPattern string = "hpc.capella.%s.power.fe"
+const hostPattern string = "%s.bmc.capella.hpc.tu-dresden.de"
+
+func NewClient(nodeName string, source *metricq.Source, username string, password string) Client {
+	hostname := fmt.Sprintf(hostPattern, nodeName)
+
+	cpu_metric := fmt.Sprintf(cpuMetricPattern, nodeName)
+	gpu_metric := fmt.Sprintf(gpuMetricPattern, nodeName)
+	node_metric := fmt.Sprintf(nodeMetricPattern, nodeName)
+	energy_metric := fmt.Sprintf(energyPattern, nodeName)
+	from_energy_metric := fmt.Sprintf(fromEnergyMetricPattern, nodeName)
+
+	return Client{
+		nil,
+		nodeName,
+		hostname,
+		username,
+		password,
+		source.Metric(cpu_metric),
+		source.Metric(gpu_metric),
+		source.Metric(node_metric),
+		source.Metric(energy_metric),
+		source.Metric(from_energy_metric),
+	}
+}
+
+func (client *Client) Connect(ctx context.Context) error {
+	slog.Info("opening IPMI connection", "node", client.nodeName)
+
+	session, err := startIPMISession(ctx, client.hostname, client.user, client.password)
+	if err != nil {
+		return fmt.Errorf("failed to open IPMI connection: %w", err)
+	}
+
+	client.ipmi = session
+
+	return nil
 }
 
 func (client *Client) Close(ctx context.Context) {
 	client.ipmi.Close(ctx)
+}
+
+func (client *Client) Reconnect(ctx context.Context) error {
+	// future me, please don't try this again. It will just
+	// crash the source constantly, as an internal channel
+	// is already closed and this would try to close a closed
+	// channel.
+	// client.ipmi.Close(ctx)
+
+	if err := client.Connect(ctx); err != nil {
+		return fmt.Errorf("failed to reconnect IPMI connection: %w", err)
+	}
+
+	return nil
 }
 
 func (client *Client) ReadExactSampleTime(ctx context.Context) (time.Duration, error) {
@@ -99,7 +161,7 @@ func (client *Client) ResetEnergyAccumulator(ctx context.Context) error {
 		return fmt.Errorf("failed to reset energy accumulator: %w", err)
 	}
 
-	if len(response.Response) != 0 {
+	if len(response.Response) != 1 && response.Response[0] != 0x0 {
 		return fmt.Errorf("failed to reset energy accumulator: unexpected buffer length: %v != 0", len(response.Response))
 	}
 
@@ -109,7 +171,7 @@ func (client *Client) ResetEnergyAccumulator(ctx context.Context) error {
 func (client *Client) SinglePowerCommand(ctx context.Context) (command.PowerReading, error) {
 	r := command.PowerReading{}
 
-	slog.Info("sending IPMI Raw Command", "node", client.nodeName, "command", "single power")
+	slog.Debug("sending IPMI Raw Command", "node", client.nodeName, "command", "single power")
 
 	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 8, 0, 0, 0}, "")
 	if err != nil {
@@ -120,13 +182,14 @@ func (client *Client) SinglePowerCommand(ctx context.Context) (command.PowerRead
 	if err != nil {
 		return r, fmt.Errorf("failed to unpack single power command response: %w", err)
 	}
+
 	return r, nil
 }
 
 func (client *Client) SingleEnergyCommand(ctx context.Context) (command.EnergyReading, error) {
 	r := command.EnergyReading{}
 
-	slog.Info("sending IPMI Raw Command", "node", client.nodeName, "command", "single energy")
+	slog.Debug("sending IPMI Raw Command", "node", client.nodeName, "command", "single energy")
 
 	response, err := client.ipmi.RawCommand(ctx, 0x3A, 0x32, []byte{4, 2, 0, 0, 0}, "")
 	if err != nil {
@@ -137,41 +200,65 @@ func (client *Client) SingleEnergyCommand(ctx context.Context) (command.EnergyRe
 	if err != nil {
 		return r, fmt.Errorf("failed to unpack single energy command response: %w", err)
 	}
+
 	return r, nil
 }
 
-func (client *Client) Reconnect(ctx context.Context) error {
-	// TODO seems like on timeout the channel is already closed.
-	// Hopefully, that's always the case, otherwise we leak channels
-	// if err := client.ipmi.Close(ctx); err != nil {
-	// 	return fmt.Errorf("failed to reconnect IPMI: %w", err)
-	// }
+func main() {
+	var verbosityFlag string
+	var metricqServer string
+	var metricqToken string
+	var sentryDsn string
 
-	session, err := startIPMISession(client.nodeName)
-	if err != nil {
-		return fmt.Errorf("failed to reconnect IPMI: %w", err)
+	flag.StringVar(&metricqServer, "server", "amqp://localhost", "metricq server URL")
+	flag.StringVar(&metricqToken, "token", "source-lenovo-power-meter", "metricq client token")
+	flag.StringVar(&sentryDsn, "sentry", "", "the sentry.io DSN to use")
+	flag.StringVar(&verbosityFlag, "verbosity", "WARN", "Sets the verbosity of logging. Allowed values: [DEBUG, INFO, WARN, ERROR]")
+	flag.StringVar(&verbosityFlag, "V", "WARN", "Sets the verbosity of logging. (shorthand)")
+	flag.Parse()
+
+	level := new(slog.LevelVar)
+
+	switch verbosityFlag {
+	case "DEBUG":
+		level.Set(slog.LevelDebug)
+	case "INFO":
+		level.Set(slog.LevelInfo)
+	case "ERROR":
+		level.Set(slog.LevelError)
+	default:
+		log.Printf("unknown input for verbosity: %v", verbosityFlag)
+		fallthrough
+	case "WARN":
+		level.Set(slog.LevelWarn)
 	}
 
-	client.ipmi = session
+	if sentryDsn != "" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn: sentryDsn,
+			// Enable printing of SDK debug messages.
+			// Useful when getting started or trying to figure something out.
+			Debug: false,
+			// Adds request headers and IP for users,
+			// visit: https://docs.sentry.io/platforms/go/data-management/data-collected/ for more info
+			SendDefaultPII: true,
+			EnableLogs:     true,
+		})
 
-	return nil
-}
+		if err != nil {
+			log.Fatalf("failed to sentry.Init: %s", err)
+		}
+		defer sentry.Flush(2 * time.Second)
+	}
 
-const cpuMetricPattern string = "hpc.capella.c%d.cpu.power.acc"
-const gpuMetricPattern string = "hpc.capella.c%d.gpu.power.acc"
-const nodeMetricPattern string = "hpc.capella.c%d.power"
-const energyPattern string = "hpc.capella.c%d.energy"
-const fromEnergyMetricPattern string = "hpc.capella.c%d.power.fe"
-const hostPattern string = "c%d.bmc.capella.hpc.tu-dresden.de"
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(h))
 
-func main() {
-	
-
-	log.Printf("opening connection to metricq")
+	slog.Info("opening connection to metricq", "token", metricqToken)
 
 	connectionStart := time.Now()
 
-	source, err := metricq.NewSource("source-capella-ipmi-raw-debug", "")
+	source, err := metricq.NewSource(metricqToken, metricqServer)
 	if err != nil {
 		log.Panicf("failed to create source: %v", err)
 	}
@@ -184,53 +271,36 @@ func main() {
 	}
 	defer source.Close()
 
-	go source.HandleDiscover(ctx, "v0.0.1")
+	go source.HandleDiscover(ctx, "v0.0.2")
 
-	// ignore config for now, we hardcode the shit out of this
-	_, err = source.Register(ctx)
+	jsonConfig, err := source.Register(ctx)
 	if err != nil {
 		log.Panicf("failed to register as metricq source: %v", err)
 	}
 
+	var config MetricQConfig
+	if err = json.Unmarshal(jsonConfig, &config); err != nil {
+		log.Panicf("failed to parse config from metricq: %v", err)
+	}
+
 	clients := make(map[string]Client)
 	metadata := make(map[string]any)
-	connectionErrors := make(map[string]int)
-	timeErrors := make(map[string]int)
-	valueErrors := make(map[string]int)
 	initMutex := sync.Mutex{}
-	errorMutex := sync.Mutex{}
 
 	wg := sync.WaitGroup{}
 	for i := 1; i <= 156; i++ {
 		wg.Add(1)
-		host := fmt.Sprintf(hostPattern, i)
-		connectionErrors[host] = 0
-		timeErrors[host] = 0
-		valueErrors[host] = 0
 
-		go func(i int, hostname string, ctx context.Context) {
+		nodeName := fmt.Sprintf("c%d", i)
+
+		go func(i int, nodeName string, ctx context.Context) {
 			defer wg.Done()
 
-			cpu_metric := fmt.Sprintf(cpuMetricPattern, i)
-			gpu_metric := fmt.Sprintf(gpuMetricPattern, i)
-			node_metric := fmt.Sprintf(nodeMetricPattern, i)
-			energy_metric := fmt.Sprintf(energyPattern, i)
-			from_energy_metric := fmt.Sprintf(fromEnergyMetricPattern, i)
-			client, err := startIPMISession(hostname)
+			c := NewClient(nodeName, source, config.User, config.Password)
 
-			if err != nil {
-				log.Printf("Failed to connect to %s: %v", hostname, err)
+			if err := c.Connect(ctx); err != nil {
+				slog.Warn("failed to connect", "node", nodeName, "err", err)
 				return
-			}
-
-			c := Client{
-				client,
-				fmt.Sprintf("c%d", i),
-				source.Metric(cpu_metric),
-				source.Metric(gpu_metric),
-				source.Metric(node_metric),
-				source.Metric(energy_metric),
-				source.Metric(from_energy_metric),
 			}
 
 			// slog.Info("starting to recalibrate sample time", "node", c.nodeName)
@@ -247,47 +317,47 @@ func main() {
 			// }
 			// slog.Info("finished to recalibrate sample time", "node", c.nodeName)
 
+			slog.Info("resetting energy counter", "node", c.nodeName)
+			if err := c.ResetEnergyAccumulator(ctx); err != nil {
+				slog.Warn(err.Error(), "node", c.nodeName)
+			} else {
+				slog.Info("successfully reset energy counter", "node", c.nodeName)
+			}
+
 			initMutex.Lock()
 			defer initMutex.Unlock()
 
-			metadata[node_metric] = metricq.MetricMetadata{
+			metadata[c.node.Name()] = metricq.MetricMetadata{
 				Description: "accurate and fast node power",
 				Unit:        "W",
 				Rate:        1,
 			}
-			metadata[cpu_metric] = metricq.MetricMetadata{
+			metadata[c.gpu.Name()] = metricq.MetricMetadata{
 				Description: "accurate and fast CPU power",
 				Unit:        "W",
 				Rate:        1,
 			}
-			metadata[gpu_metric] = metricq.MetricMetadata{
+			metadata[c.cpu.Name()] = metricq.MetricMetadata{
 				Description: "accurate and fast GPU power",
 				Unit:        "W",
 				Rate:        1,
 			}
-			metadata[energy_metric] = metricq.MetricMetadata{
+			metadata[c.energy.Name()] = metricq.MetricMetadata{
 				Description: "accurate and fast node energy",
 				Unit:        "J",
 				Rate:        1,
 			}
-			metadata[from_energy_metric] = metricq.MetricMetadata{
+			metadata[c.fromEnergy.Name()] = metricq.MetricMetadata{
 				Description: "accurate and fast node power from energy",
 				Unit:        "W",
 				Rate:        1,
 			}
 
-			clients[hostname] = c
-		}(i, host, ctx)
+			clients[nodeName] = c
+		}(i, nodeName, ctx)
 	}
 
 	wg.Wait()
-
-	hosts := make([]string, 0, len(clients))
-	for k := range clients {
-		hosts = append(hosts, k)
-	}
-
-	slices.Sort(hosts)
 
 	err = source.DeclareMetrics(ctx, metadata)
 	if err != nil {
@@ -301,13 +371,13 @@ func main() {
 
 	wg = sync.WaitGroup{}
 
-	for host, client := range clients {
+	for nodeName, client := range clients {
 
 		wg.Add(1)
 
 		deadline := time.Now().Add(time.Second)
 
-		go func(host string, client Client, deadline time.Time) {
+		go func(nodeName string, client Client, deadline time.Time) {
 			defer wg.Done()
 			defer client.Close(ctx)
 
@@ -320,46 +390,36 @@ func main() {
 
 				r, err := client.SinglePowerCommand(ctx)
 				if err != nil {
-					slog.Error(fmt.Sprintf("failed to execute raw command for power: %v", err), "node", host)
-					errorMutex.Lock()
-					connectionErrors[host] += 1
-					errorMutex.Unlock()
+					slog.Warn("failed to execute raw command", "node", nodeName, "command", "single power", "err", err)
 					if err := client.Reconnect(ctx); err != nil {
-						slog.Error(fmt.Sprintf("failed to reconnect IPMI: %v", err), "node", host)
+						slog.Error("failed to reconnect", "node", nodeName, "err", err)
 					}
 				} else {
-
 					if r.CpuPower() > 1000 {
-						slog.Warn("read implausible cpu power value", "node", host, "value", r.CpuPower())
-						errorMutex.Lock()
-						valueErrors[host] += 1
-						errorMutex.Unlock()
+						slog.Info("read implausible cpu power value", "node", nodeName, "value", r.CpuPower())
 					}
 
 					if r.GpuPower() > 4000 {
-						slog.Warn("read implausible gpu power value", "node", host, "value", r.GpuPower())
-						errorMutex.Lock()
-						valueErrors[host] += 1
-						errorMutex.Unlock()
+						slog.Info("read implausible gpu power value", "node", nodeName, "value", r.GpuPower())
 					}
 
-					slog.Debug(fmt.Sprintf("Read Power Values for %s: %d W CPU; %d W GPU", host, int(r.CpuPower()), int(r.GpuPower())), "node", host)
+					slog.Debug("read power values", "cpu", r.CpuPower(), "gpu", r.GpuPower(), "node", nodeName)
 
 					err = client.cpu.Send(ctx, start, r.CpuPower())
 					if err != nil {
-						slog.Error("failed to send metric", "node", host, "err", err, "metric", client.cpu.Name())
+						slog.Error("failed to send metric", "node", nodeName, "err", err, "metric", client.cpu.Name())
 						panic(err)
 					}
 
 					err = client.gpu.Send(ctx, start, r.GpuPower())
 					if err != nil {
-						slog.Error("failed to send metric", "node", host, "err", err, "metric", client.gpu.Name())
+						slog.Error("failed to send metric", "node", nodeName, "err", err, "metric", client.gpu.Name())
 						panic(err)
 					}
 
 					err = client.node.Send(ctx, start, r.NodePower())
 					if err != nil {
-						slog.Error("failed to send metric", "node", host, "err", err, "metric", client.node.Name())
+						slog.Error("failed to send metric", "node", nodeName, "err", err, "metric", client.node.Name())
 						panic(err)
 					}
 				}
@@ -367,28 +427,22 @@ func main() {
 				start = time.Now()
 				currentReading, err := client.SingleEnergyCommand(ctx)
 				if err != nil {
-					slog.Error(fmt.Sprintf("failed to execute raw command: %v", err), "node", host, "command", "single energy")
-					errorMutex.Lock()
-					connectionErrors[host] += 1
-					errorMutex.Unlock()
+					slog.Warn("failed to execute raw command", "node", nodeName, "command", "single energy", "err", err)
+					if err := client.Reconnect(ctx); err != nil {
+						slog.Error("failed to reconnect", "node", nodeName, "err", err)
+					}
 				} else {
 					hostTime := time.Now()
 					if lastReading != nil {
 						timestamp := currentReading.Time()
 						offset := hostTime.Sub(timestamp)
 						if offset.Abs().Seconds() > 10 {
-							slog.Warn("read implausible energy timestamp", "node", host, "offset", int(offset.Seconds()), "timestamp", timestamp, "hostTime", hostTime)
-							errorMutex.Lock()
-							timeErrors[host] += 1
-							errorMutex.Unlock()
+							slog.Info("read implausible energy timestamp", "node", nodeName, "offset", int(offset.Seconds()), "timestamp", timestamp, "hostTime", hostTime)
 						}
 
 						duration_s := timestamp.Sub(lastReading.Time()).Seconds()
 						if duration_s < 0 {
-							slog.Warn("duration is negative", "node", host, "lastTimestamp", lastReading.Time(), "timestamp", timestamp)
-							errorMutex.Lock()
-							timeErrors[host] += 1
-							errorMutex.Unlock()
+							slog.Info("measurement interval duration is negative", "node", nodeName, "lastTimestamp", lastReading.Time(), "timestamp", timestamp)
 						}
 
 						// using host time instead to calculate the energy
@@ -396,21 +450,18 @@ func main() {
 
 						energy_j := currentReading.Energy() - lastReading.Energy()
 						if energy_j < 0 {
-							slog.Warn("energy is negative. Possible overflow?", "node", host, "previous energy", lastReading.Energy(), "current energy", currentReading.Energy())
-							errorMutex.Lock()
-							valueErrors[host] += 1
-							errorMutex.Unlock()
+							slog.Info("energy is negative. Possible overflow?", "node", nodeName, "previous energy", lastReading.Energy(), "current energy", currentReading.Energy())
 						}
 
 						err = client.energy.Send(ctx, start, currentReading.Energy())
 						if err != nil {
-							slog.Error("failed to send metric", "node", host, "err", err, "metric", client.energy.Name())
+							slog.Error("failed to send metric", "node", nodeName, "err", err, "metric", client.energy.Name())
 							panic(err)
 						}
 
-						err = client.from_energy.Send(ctx, start, energy_j/duration_s)
+						err = client.fromEnergy.Send(ctx, start, energy_j/duration_s)
 						if err != nil {
-							slog.Error("failed to send metric", "node", host, "err", err, "metric", client.from_energy.Name())
+							slog.Error("failed to send metric", "node", nodeName, "err", err, "metric", client.fromEnergy.Name())
 							panic(err)
 						}
 					}
@@ -420,14 +471,10 @@ func main() {
 				}
 
 				if deadline.Before(time.Now()) {
-					slog.Warn("missed deadline", "node", host)
+					slog.Info("missed deadline", "node", nodeName, "deadline", deadline, "now", time.Now())
 				}
 
 				for ; deadline.Before(time.Now()); deadline = deadline.Add(time.Second) {
-					// we count every missed deadline as one connection error
-					errorMutex.Lock()
-					connectionErrors[host] += 1
-					errorMutex.Unlock()
 				}
 
 				select {
@@ -438,55 +485,8 @@ func main() {
 					continue
 				}
 			}
-		}(host, client, deadline)
-
+		}(nodeName, client, deadline)
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		for {
-
-			log.Print("------------------------------------------------------")
-			log.Print("Errored hosts in last 60 seconds:")
-
-			errorMutex.Lock()
-
-			numErroredHosts := 0
-			numTotalErrors := 0
-
-			for _, host := range hosts {
-				numConnectionErrors := connectionErrors[host]
-				numTimeErrors := timeErrors[host]
-				numValueErrors := valueErrors[host]
-
-				if numConnectionErrors > 0 || numTimeErrors > 0 || numValueErrors > 0 {
-					log.Printf("[%34s] (%3d / %3d / %3d) %s%s%s", host, numConnectionErrors, numTimeErrors, numValueErrors, strings.Repeat("C", numConnectionErrors), strings.Repeat("t", numTimeErrors), strings.Repeat("V", numValueErrors))
-					connectionErrors[host] = 0
-					timeErrors[host] = 0
-					valueErrors[host] = 0
-					numErroredHosts += 1
-					numTotalErrors += numConnectionErrors
-				}
-			}
-			errorMutex.Unlock()
-
-			if numErroredHosts > 0 {
-				log.Printf("[Total %d of %d hosts] (%d) %s", numErroredHosts, len(clients), numTotalErrors, strings.Repeat("C", numTotalErrors))
-			}
-
-			log.Print("------------------------------------------------------")
-
-			select {
-			case <-ctx.Done():
-				log.Print("finished error watcher.")
-				return
-			case <-time.After(60 * time.Second):
-				continue
-			}
-		}
-	}()
 
 	wg.Wait()
 }
