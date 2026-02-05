@@ -8,6 +8,7 @@ require (
 	github.com/VividCortex/gohistogram v1.0.0
 	github.com/bougou/go-ipmi v0.7.3
 	github.com/getsentry/sentry-go v0.42.0
+	github.com/getsentry/sentry-go/slog v0.42.0
 	github.com/metricq/metricq-go v0.0.0
 )
 
@@ -19,10 +20,10 @@ require (
 	github.com/olekukonko/tablewriter v0.0.5 // indirect
 	github.com/rabbitmq/amqp091-go v1.8.1 // indirect
 	github.com/rogpeppe/go-internal v1.8.0 // indirect
-	github.com/stretchr/testify v1.9.0 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/net v0.0.0-20210813160813-60bc85c4be6d // indirect
-	golang.org/x/sys v0.18.0 // indirect
-	golang.org/x/text v0.14.0 // indirect
+	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/text v0.22.0 // indirect
 	google.golang.org/protobuf v1.27.1 // indirect
 )
 

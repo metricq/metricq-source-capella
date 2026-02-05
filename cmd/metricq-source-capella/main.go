@@ -15,6 +15,8 @@ import (
 
 	"github.com/bougou/go-ipmi"
 	"github.com/getsentry/sentry-go"
+	"github.com/getsentry/sentry-go/attribute"
+	sentryslog "github.com/getsentry/sentry-go/slog"
 	metricq "github.com/metricq/metricq-go"
 
 	"github.com/metricq/metricq-source-capella/pkg/command"
@@ -219,11 +221,18 @@ func main() {
 
 	level := new(slog.LevelVar)
 
+	sentryLogLevels := []slog.Level{slog.LevelError}
+
 	switch verbosityFlag {
 	case "DEBUG":
 		level.Set(slog.LevelDebug)
+		sentryLogLevels = append(sentryLogLevels, slog.LevelDebug)
+		sentryLogLevels = append(sentryLogLevels, slog.LevelInfo)
+		sentryLogLevels = append(sentryLogLevels, slog.LevelWarn)
 	case "INFO":
 		level.Set(slog.LevelInfo)
+		sentryLogLevels = append(sentryLogLevels, slog.LevelInfo)
+		sentryLogLevels = append(sentryLogLevels, slog.LevelWarn)
 	case "ERROR":
 		level.Set(slog.LevelError)
 	default:
@@ -231,7 +240,16 @@ func main() {
 		fallthrough
 	case "WARN":
 		level.Set(slog.LevelWarn)
+		sentryLogLevels = append(sentryLogLevels, slog.LevelWarn)
 	}
+
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(h))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var meter sentry.Meter
 
 	if sentryDsn != "" {
 		err := sentry.Init(sentry.ClientOptions{
@@ -241,18 +259,21 @@ func main() {
 			Debug: false,
 			// Adds request headers and IP for users,
 			// visit: https://docs.sentry.io/platforms/go/data-management/data-collected/ for more info
-			SendDefaultPII: true,
-			EnableLogs:     true,
+			SendDefaultPII:   true,
+			EnableLogs:       true,
+			EnableTracing:    true,
+			TracesSampleRate: 0.001,
 		})
 
 		if err != nil {
 			log.Fatalf("failed to sentry.Init: %s", err)
 		}
 		defer sentry.Flush(2 * time.Second)
-	}
 
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
-	slog.SetDefault(slog.New(h))
+		handler := sentryslog.Option{LogLevel: sentryLogLevels}.NewSentryHandler(ctx)
+		slog.SetDefault(slog.New(handler))
+		meter = sentry.NewMeter(ctx)
+	}
 
 	slog.Info("opening connection to metricq", "token", metricqToken)
 
@@ -262,9 +283,6 @@ func main() {
 	if err != nil {
 		log.Panicf("failed to create source: %v", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	if err = source.Connect(ctx); err != nil {
 		log.Panicf("failed to open connection to metricq: %v", err)
@@ -377,18 +395,38 @@ func main() {
 
 		deadline := time.Now().Add(time.Second)
 
-		go func(nodeName string, client Client, deadline time.Time) {
+		go func(ctx context.Context, nodeName string, client Client, deadline time.Time) {
 			defer wg.Done()
 			defer client.Close(ctx)
+
+			hub := sentry.GetHubFromContext(ctx)
+			if hub == nil {
+				hub = sentry.CurrentHub().Clone()
+				ctx = sentry.SetHubOnContext(ctx, hub)
+			}
 
 			var lastReading *command.EnergyReading
 			var lastTimestamp time.Time
 
 		WorkerLoop:
 			for {
+				transaction := sentry.StartTransaction(
+					ctx,
+					"worker_loop_iteration",
+				)
+				transaction.SetData("node", nodeName)
+
+				span := transaction.StartChild("power_command")
+				span.SetData("node", nodeName)
+
 				start := time.Now()
 
 				r, err := client.SinglePowerCommand(ctx)
+
+				if meter != nil {
+					meter.Distribution("request time", float64(time.Now().Sub(start).Milliseconds()), sentry.WithUnit(sentry.UnitMillisecond), sentry.WithAttributes(attribute.String("node", nodeName)))
+				}
+
 				if err != nil {
 					slog.Warn("failed to execute raw command", "node", nodeName, "command", "single power", "err", err)
 					if err := client.Reconnect(ctx); err != nil {
@@ -423,21 +461,30 @@ func main() {
 						panic(err)
 					}
 				}
+				span.Finish()
+
+				span = transaction.StartChild("energy_command")
+				span.SetData("node", nodeName)
 
 				start = time.Now()
+
 				currentReading, err := client.SingleEnergyCommand(ctx)
+
+				if meter != nil {
+					meter.WithCtx(ctx).Distribution("request time", float64(time.Now().Sub(start).Milliseconds()), sentry.WithUnit(sentry.UnitMillisecond), sentry.WithAttributes(attribute.String("node", nodeName)))
+				}
+
 				if err != nil {
 					slog.Warn("failed to execute raw command", "node", nodeName, "command", "single energy", "err", err)
 					if err := client.Reconnect(ctx); err != nil {
 						slog.Error("failed to reconnect", "node", nodeName, "err", err)
 					}
 				} else {
-					hostTime := time.Now()
 					if lastReading != nil {
 						timestamp := currentReading.Time()
-						offset := hostTime.Sub(timestamp)
+						offset := start.Sub(timestamp)
 						if offset.Abs().Seconds() > 10 {
-							slog.Info("read implausible energy timestamp", "node", nodeName, "offset", int(offset.Seconds()), "timestamp", timestamp, "hostTime", hostTime)
+							slog.Debug("read implausible energy timestamp", "node", nodeName, "offset", int(offset.Seconds()), "timestamp", timestamp, "hostTime", start)
 						}
 
 						duration_s := timestamp.Sub(lastReading.Time()).Seconds()
@@ -446,7 +493,7 @@ func main() {
 						}
 
 						// using host time instead to calculate the energy
-						duration_s = hostTime.Sub(lastTimestamp).Seconds()
+						duration_s = start.Sub(lastTimestamp).Seconds()
 
 						energy_j := currentReading.Energy() - lastReading.Energy()
 						if energy_j < 0 {
@@ -467,8 +514,9 @@ func main() {
 					}
 
 					lastReading = &currentReading
-					lastTimestamp = hostTime
+					lastTimestamp = start
 				}
+				span.Finish()
 
 				if deadline.Before(time.Now()) {
 					slog.Info("missed deadline", "node", nodeName, "deadline", deadline, "now", time.Now())
@@ -476,6 +524,8 @@ func main() {
 
 				for ; deadline.Before(time.Now()); deadline = deadline.Add(time.Second) {
 				}
+
+				transaction.Finish()
 
 				select {
 				case <-ctx.Done():
@@ -485,7 +535,7 @@ func main() {
 					continue
 				}
 			}
-		}(nodeName, client, deadline)
+		}(ctx, nodeName, client, deadline)
 	}
 
 	wg.Wait()

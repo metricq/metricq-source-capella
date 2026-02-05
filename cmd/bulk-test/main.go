@@ -270,18 +270,18 @@ func main() {
 			var lastBulkReading *command.BulkEnergyReading
 
 			if reading, err := client.BulkEnergyCommand(ctx); err != nil {
-                log.Fatal("failed first reading. Node not available?")
+				log.Fatal("failed first reading. Node not available?")
 			} else {
 				lastBulkReading = &reading
 			}
 
 		WorkerLoop:
 			for {
-                // start := time.Now()
+				// start := time.Now()
 				currentBulkReading, err := client.BulkEnergyCommand(ctx)
-                // end := time.Now()
+				// end := time.Now()
 
-                //slog.Info(fmt.Sprintf("request took %v ms", end.Sub(start).Milliseconds()))
+				//slog.Info(fmt.Sprintf("request took %v ms", end.Sub(start).Milliseconds()))
 
 				if err != nil {
 					slog.Error(fmt.Sprintf("failed to execute raw command: %v", err), "node", host, "command", "single energy")
@@ -295,7 +295,7 @@ func main() {
 
 						lastBulkReading = &currentBulkReading
 						fmt.Print(hg.String())
-                        fmt.Printf("Mean: %v", hg.Mean())
+						fmt.Printf("Mean: %v", hg.Mean())
 					}
 				}
 
